@@ -18,7 +18,7 @@ https://user-images.githubusercontent.com/46858047/211209772-de3cf8f8-007d-4963-
  [see simswap installation](https://github.com/neuralchen/SimSwap/blob/main/docs/guidance/preparation.md)
 - Activate simswap python environment and install tkinterdnd2
 ```pip install tkinterdnd2```
-- Copy [simswap_gui.py](https://raw.githubusercontent.com/harisreedhar/SimSwap/GUI/simswap_gui.py) file to the root of simswap directory.
+- Copy [simswap_gui.py](https://raw.githubusercontent.com/harisreedhar/SimSwap-GUI/main/simswap_gui.py) file to the root of simswap directory.
 - Run ``python simswap_gui.py``
 
 ## Loved my work?
