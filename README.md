@@ -6,7 +6,7 @@ https://user-images.githubusercontent.com/46858047/211209772-de3cf8f8-007d-4963-
 
 ## GUI Features
 
-- Single .py file. Made with tkinter
+- Made with tkinter
 - Support Drag and Drop files (tkinterdnd)
 - Video viewer with trim tool
 - Live target face selector
