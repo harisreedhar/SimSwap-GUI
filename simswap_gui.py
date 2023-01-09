@@ -86,7 +86,7 @@ class SimSwap:
                 vis_parsing_anno = parsing.copy().astype(np.uint8)
                 tgt_mask = encode_segmentation_rgb(vis_parsing_anno)
                 if tgt_mask.sum() >= 5000:
-                    target_mask = cv2.resize(tgt_mask, (224,  224))
+                    target_mask = cv2.resize(tgt_mask, (crop_size,  crop_size))
                     target_image_parsing = postprocess(swaped_img, source_img[0].cpu().detach().numpy().transpose((1, 2, 0)), target_mask,smooth_mask)
                     target_image = cv2.warpAffine(target_image_parsing, mat_rev, orisize)
                 else:
@@ -96,7 +96,6 @@ class SimSwap:
             img_white = cv2.warpAffine(img_white, mat_rev, orisize)
             img_white[img_white>20] =255
             img_mask = img_white
-            #kernel = np.ones((40,40),np.uint8)
             kernel = np.ones(_kernel_size,np.uint8)
             img_mask = cv2.erode(img_mask,kernel,iterations = 1)
             kernel_size = (20, 20)
@@ -120,8 +119,8 @@ class SimSwap:
         cv2.imwrite(save_path, final_img)
         return final_img
 
-    def video_swap(video_path, id_vetor, swap_model, detect_model, save_path, temp_results_dir='./temp_results', crop_size=224,
-        no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40)):
+    def video_swap(video_path, id_vetor, swap_model, detect_model, save_path, temp_results_dir='./temp_results',
+        crop_size=224, no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40)):
         video_forcheck = VideoFileClip(video_path)
         if video_forcheck.audio is None:
             no_audio = True
@@ -164,6 +163,7 @@ class SimSwap:
                     for frame_align_crop in frame_align_crop_list:
                         frame_align_crop_tenor = SimSwap._totensor(cv2.cvtColor(frame_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
                         swap_result = swap_model(None, frame_align_crop_tenor, id_vetor, None, True)[0]
+                        cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
                         swap_result_list.append(swap_result)
                         frame_align_crop_tenor_list.append(frame_align_crop_tenor)
                     final_img = SimSwap.reverse2wholeimage(frame_align_crop_tenor_list,swap_result_list, frame_mat_list, crop_size, frame, logoclass,\
@@ -193,8 +193,10 @@ class SimSwap:
             clips = clips.set_audio(video_audio_clip)
         clips.write_videofile(save_path,audio_codec='aac')
 
-    def video_target_swap(video_path, id_vetor,specific_person_id_nonorm,id_thres, swap_model, detect_model, save_path, temp_results_dir='./temp_results',
+    def video_target_swap(video_path, id_vetor,specific_person_id_nonorm,id_thres, swap_model,
+        detect_model, save_path, temp_results_dir='./temp_results',
         crop_size=224, no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40)):
+
         video_forcheck = VideoFileClip(video_path)
         if video_forcheck.audio is None:
             no_audio = True
@@ -238,7 +240,7 @@ class SimSwap:
                     for frame_align_crop in frame_align_crop_list:
                         frame_align_crop_tenor = SimSwap._totensor(cv2.cvtColor(frame_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
                         frame_align_crop_tenor_arcnorm = spNorm(frame_align_crop_tenor)
-                        frame_align_crop_tenor_arcnorm_downsample = F.interpolate(frame_align_crop_tenor_arcnorm, scale_factor=0.5)
+                        frame_align_crop_tenor_arcnorm_downsample = F.interpolate(frame_align_crop_tenor_arcnorm, size=(112,112))
                         frame_align_crop_crop_id_nonorm = swap_model.netArc(frame_align_crop_tenor_arcnorm_downsample)
                         id_compare_values.append(mse(frame_align_crop_crop_id_nonorm,specific_person_id_nonorm).detach().cpu().numpy())
                         frame_align_crop_tenor_list.append(frame_align_crop_tenor)
@@ -262,6 +264,7 @@ class SimSwap:
                         if not no_simswaplogo:
                             frame = logoclass.apply_frames(frame)
                         cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
+
                 else:
                     if not os.path.exists(temp_results_dir):
                         os.mkdir(temp_results_dir)
@@ -294,16 +297,23 @@ class SimSwap:
         opt.no_simswaplogo = settings.simswap_logo.get()
 
         start_epoch, epoch_iter = 1, 0
-        crop_size = int(settings.crop_size.get())
+        opt.crop_size = int(settings.crop_size.get())
+        crop_size = opt.crop_size
         det_size = int(settings.det_size.get())
         _kernel_size = tuple(map(int, settings.kernel_size.get().split(' ')))
 
         torch.nn.Module.dump_patches = True
+        if crop_size == 512:
+            opt.which_epoch = 550000
+            opt.name = '512'
+            mode = 'None'
+        else:
+            mode = 'None'
         model = create_model(opt)
         model.eval()
 
         app = Face_detect_crop(name='antelope', root='./insightface_func/models')
-        app.prepare(ctx_id= 0, det_thresh=settings.det_thresh.get(), det_size=(det_size,det_size))
+        app.prepare(ctx_id= 0, det_thresh=settings.det_thresh.get(), det_size=(det_size,det_size), mode=mode)
 
         with torch.no_grad():
             img_a_whole = srcImg
@@ -314,12 +324,12 @@ class SimSwap:
 
             img_id = img_id.cuda()
 
-            img_id_downsample = F.interpolate(img_id, scale_factor=0.5)
+            img_id_downsample = F.interpolate(img_id, size=(112,112))
             latend_id = model.netArc(img_id_downsample)
             latend_id = F.normalize(latend_id, p=2, dim=1)
 
             if swap_all:
-                img_id_downsample = F.interpolate(img_id, scale_factor=0.5)
+                img_id_downsample = F.interpolate(img_id, size=(112,112))
                 latend_id = model.netArc(img_id_downsample)
                 latend_id = F.normalize(latend_id, p=2, dim=1)
 
@@ -332,11 +342,23 @@ class SimSwap:
                 specific_person = transformer_Arcface(specific_person_align_crop_pil)
                 specific_person = specific_person.view(-1, specific_person.shape[0], specific_person.shape[1], specific_person.shape[2])
                 specific_person = specific_person.cuda()
-                specific_person_downsample = F.interpolate(specific_person, scale_factor=0.5)
+                specific_person_downsample = F.interpolate(specific_person, size=(112,112))
                 specific_person_id_nonorm = model.netArc(specific_person_downsample)
 
-                SimSwap.video_target_swap(opt.video_path, latend_id, specific_person_id_nonorm, opt.id_thres, \
-                    model, app, opt.output_path,temp_results_dir=opt.temp_path,no_simswaplogo=opt.no_simswaplogo,use_mask=opt.use_mask, self_obj=self_obj, _kernel_size=_kernel_size)
+                SimSwap.video_target_swap(
+                    opt.video_path,
+                    latend_id,
+                    specific_person_id_nonorm,
+                    opt.id_thres,
+                    model,
+                    app,
+                    opt.output_path,
+                    temp_results_dir=opt.temp_path,
+                    no_simswaplogo=opt.no_simswaplogo,
+                    use_mask=opt.use_mask,
+                    crop_size=crop_size,
+                    self_obj=self_obj,
+                    _kernel_size=_kernel_size)
 
 class Utils:
     def remove_files(folder):
