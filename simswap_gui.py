@@ -4,6 +4,7 @@ import glob
 import uuid
 import time
 import shutil
+import subprocess
 import platform
 import threading
 import webbrowser
@@ -47,9 +48,15 @@ MASK_KERNEL = "40 40"
 DET_SIZE = 640
 DET_THRESHOLD = 0.6
 USE_MASK = True
-DISABLE_WATERMARK = True
+WATERMARK = False
 THEME_STYLE = 'clam'
+FFHQ = False
+FACE_PART_IDS = "1 2 3 4 5 6 10 12 13"
 ######################################## DEFAULTS ########################################
+
+# The codes are currently a huge mess.
+# I don't have too much time to beautify code... So here is what it is.
+# will clean things later
 
 class SimSwap:
     def _totensor(array):
@@ -57,8 +64,22 @@ class SimSwap:
         img = tensor.transpose(0, 1).transpose(0, 2).contiguous()
         return img.float().div(255)
 
+    def encode_segmentation_rgb(segmentation, no_neck=True, face_part_ids=[1, 2, 3, 4, 5, 6, 10, 12, 13]):
+        parse = segmentation
+        #face_part_ids = [1, 2, 3, 4, 5, 6, 10, 12, 13] if no_neck else [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 14]
+        mouth_id = 11
+        face_map = np.zeros([parse.shape[0], parse.shape[1]])
+        mouth_map = np.zeros([parse.shape[0], parse.shape[1]])
+        for valid_id in face_part_ids:
+            valid_index = np.where(parse==valid_id)
+            face_map[valid_index] = 255
+        valid_index = np.where(parse==mouth_id)
+        mouth_map[valid_index] = 255
+        return np.stack([face_map, mouth_map], axis=2)
+
     def reverse2wholeimage(b_align_crop_tenor_list,swaped_imgs, mats, crop_size, oriimg, logoclass, save_path = '', \
-                        no_simswaplogo = False,pasring_model =None,norm = None, use_mask = False, _kernel_size=(40,40)):
+                        no_simswaplogo = False,pasring_model =None,norm = None, use_mask = False, _kernel_size=(40,40)
+                        , face_part_ids=[1, 2, 3, 4, 5, 6, 10, 12, 13]):
         target_image_list = []
         img_mask_list = []
         if use_mask:
@@ -84,7 +105,7 @@ class SimSwap:
                 out = pasring_model(source_img_512)[0]
                 parsing = out.squeeze(0).detach().cpu().numpy().argmax(0)
                 vis_parsing_anno = parsing.copy().astype(np.uint8)
-                tgt_mask = encode_segmentation_rgb(vis_parsing_anno)
+                tgt_mask = SimSwap.encode_segmentation_rgb(vis_parsing_anno, face_part_ids=face_part_ids)
                 if tgt_mask.sum() >= 5000:
                     target_mask = cv2.resize(tgt_mask, (crop_size,  crop_size))
                     target_image_parsing = postprocess(swaped_img, source_img[0].cpu().detach().numpy().transpose((1, 2, 0)), target_mask,smooth_mask)
@@ -120,7 +141,7 @@ class SimSwap:
         return final_img
 
     def video_swap(video_path, id_vetor, swap_model, detect_model, save_path, temp_results_dir='./temp_results',
-        crop_size=224, no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40)):
+        crop_size=224, no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40), face_part_ids=[1,2]):
         video_forcheck = VideoFileClip(video_path)
         if video_forcheck.audio is None:
             no_audio = True
@@ -167,7 +188,31 @@ class SimSwap:
                         swap_result_list.append(swap_result)
                         frame_align_crop_tenor_list.append(frame_align_crop_tenor)
                     final_img = SimSwap.reverse2wholeimage(frame_align_crop_tenor_list,swap_result_list, frame_mat_list, crop_size, frame, logoclass,\
-                        os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,use_mask=use_mask, norm = spNorm, _kernel_size=_kernel_size)
+                        os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,
+                        use_mask=use_mask, norm = spNorm, _kernel_size=_kernel_size, face_part_ids=face_part_ids)
+
+                    ########################################### Two pass #####################################################################################
+                    if self_obj.settings.two_pass.get():
+                        self_obj.set_status(f"Performing two pass... ({int((frame_index/frame_count)*100)}% completed)")
+                        detect_results = detect_model.get(final_img,crop_size)
+                        if detect_results is not None:
+                            if not os.path.exists(temp_results_dir):
+                                    os.mkdir(temp_results_dir)
+                            frame_align_crop_list = detect_results[0]
+                            frame_mat_list = detect_results[1]
+                            swap_result_list = []
+                            frame_align_crop_tenor_list = []
+                            for frame_align_crop in frame_align_crop_list:
+                                frame_align_crop_tenor = SimSwap._totensor(cv2.cvtColor(frame_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
+                                swap_result = swap_model(None, frame_align_crop_tenor, id_vetor, None, True)[0]
+                                cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
+                                swap_result_list.append(swap_result)
+                                frame_align_crop_tenor_list.append(frame_align_crop_tenor)
+                            final_img = SimSwap.reverse2wholeimage(frame_align_crop_tenor_list,swap_result_list, frame_mat_list, crop_size, frame, logoclass,\
+                                os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,
+                                use_mask=use_mask, norm = spNorm, _kernel_size=_kernel_size, face_part_ids=face_part_ids)
+                    ########################################### Two pass #####################################################################################
+
                     try:
                         if self_obj.stop_process:
                             return
@@ -181,7 +226,7 @@ class SimSwap:
                     if not no_simswaplogo:
                         frame = logoclass.apply_frames(frame)
                     cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
-                    self_obj.set_status(f"Skip...")
+                    self_obj.set_status(f"Skipping no face...({int((frame_index/frame_count)*100)}% completed)")
             else:
                 break
         video.release()
@@ -195,7 +240,7 @@ class SimSwap:
 
     def video_target_swap(video_path, id_vetor,specific_person_id_nonorm,id_thres, swap_model,
         detect_model, save_path, temp_results_dir='./temp_results',
-        crop_size=224, no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40)):
+        crop_size=224, no_simswaplogo = False,use_mask =False, self_obj=None, _kernel_size=(40, 40), face_part_ids=[1,2]):
 
         video_forcheck = VideoFileClip(video_path)
         if video_forcheck.audio is None:
@@ -250,7 +295,31 @@ class SimSwap:
                     if min_value < id_thres:
                         swap_result = swap_model(None, frame_align_crop_tenor_list[min_index], id_vetor, None, True)[0]
                         final_img = SimSwap.reverse2wholeimage([frame_align_crop_tenor_list[min_index]], [swap_result], [frame_mat_list[min_index]], crop_size, frame, logoclass,\
-                            os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,use_mask= use_mask, norm = spNorm, _kernel_size=_kernel_size)
+                            os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,
+                            use_mask= use_mask, norm = spNorm, _kernel_size=_kernel_size, face_part_ids=face_part_ids)
+
+                        ########################################### Two pass #####################################################################################
+                        if self_obj.settings.two_pass.get():
+                            self_obj.set_status(f"Performing two pass... ({int((frame_index/frame_count)*100)}% completed)")
+                            detect_results = detect_model.get(final_img,crop_size)
+                            if detect_results is not None:
+                                if not os.path.exists(temp_results_dir):
+                                        os.mkdir(temp_results_dir)
+                                frame_align_crop_list = detect_results[0]
+                                frame_mat_list = detect_results[1]
+                                swap_result_list = []
+                                frame_align_crop_tenor_list = []
+                                for frame_align_crop in frame_align_crop_list:
+                                    frame_align_crop_tenor = SimSwap._totensor(cv2.cvtColor(frame_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
+                                    swap_result = swap_model(None, frame_align_crop_tenor, id_vetor, None, True)[0]
+                                    cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
+                                    swap_result_list.append(swap_result)
+                                    frame_align_crop_tenor_list.append(frame_align_crop_tenor)
+                                final_img = SimSwap.reverse2wholeimage(frame_align_crop_tenor_list,swap_result_list, frame_mat_list, crop_size, frame, logoclass,\
+                                    os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,
+                                    use_mask=use_mask, norm = spNorm, _kernel_size=_kernel_size, face_part_ids=face_part_ids)
+                        ########################################### Two pass #####################################################################################
+
                         try:
                             if self_obj.stop_process:
                                 return
@@ -272,7 +341,145 @@ class SimSwap:
                     if not no_simswaplogo:
                         frame = logoclass.apply_frames(frame)
                     cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
-                    self_obj.set_status(f"Skip...")
+                    self_obj.set_status(f"Skipping no face...({int((frame_index/frame_count)*100)}% completed)")
+            else:
+                break
+        video.release()
+        self_obj.set_status(f"Merging sequence...")
+        path = os.path.join(temp_results_dir,'*.jpg')
+        image_filenames = sorted(glob.glob(path))
+        clips = ImageSequenceClip(image_filenames,fps = fps)
+        if not no_audio:
+            clips = clips.set_audio(video_audio_clip)
+        clips.write_videofile(save_path,audio_codec='aac')
+
+    def video_swap_multispecific(video_path, target_id_norm_list,source_specific_id_nonorm_list,id_thres, swap_model,
+        detect_model, save_path, temp_results_dir='./temp_results', crop_size=224, no_simswaplogo = False,use_mask =False,
+        self_obj=None, _kernel_size=(40, 40), face_part_ids=[1,2]):
+        video_forcheck = VideoFileClip(video_path)
+        if video_forcheck.audio is None:
+            no_audio = True
+        else:
+            no_audio = False
+        del video_forcheck
+        if not no_audio:
+            video_audio_clip = AudioFileClip(video_path)
+        video = cv2.VideoCapture(video_path)
+        logoclass = watermark_image('./simswaplogo/simswaplogo.png')
+        ret = True
+        frame_index = 0
+        frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = video.get(cv2.CAP_PROP_FPS)
+        if  os.path.exists(temp_results_dir):
+                shutil.rmtree(temp_results_dir)
+        spNorm =SpecificNorm()
+        mse = torch.nn.MSELoss().cuda()
+        if use_mask:
+            n_classes = 19
+            net = BiSeNet(n_classes=n_classes)
+            net.cuda()
+            save_pth = os.path.join('./parsing_model/checkpoint', '79999_iter.pth')
+            net.load_state_dict(torch.load(save_pth))
+            net.eval()
+        else:
+            net =None
+        for frame_index in tqdm(range(frame_count)):
+            ret, frame = video.read()
+            if  ret:
+                detect_results = detect_model.get(frame,crop_size)
+                if detect_results is not None:
+                    if not os.path.exists(temp_results_dir):
+                            os.mkdir(temp_results_dir)
+                    frame_align_crop_list = detect_results[0]
+                    frame_mat_list = detect_results[1]
+                    id_compare_values = []
+                    frame_align_crop_tenor_list = []
+                    for frame_align_crop in frame_align_crop_list:
+                        frame_align_crop_tenor = SimSwap._totensor(cv2.cvtColor(frame_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
+                        frame_align_crop_tenor_arcnorm = spNorm(frame_align_crop_tenor)
+                        frame_align_crop_tenor_arcnorm_downsample = F.interpolate(frame_align_crop_tenor_arcnorm, size=(112,112))
+                        frame_align_crop_crop_id_nonorm = swap_model.netArc(frame_align_crop_tenor_arcnorm_downsample)
+                        id_compare_values.append([])
+                        for source_specific_id_nonorm_tmp in source_specific_id_nonorm_list:
+                            id_compare_values[-1].append(mse(frame_align_crop_crop_id_nonorm,source_specific_id_nonorm_tmp).detach().cpu().numpy())
+                        frame_align_crop_tenor_list.append(frame_align_crop_tenor)
+                    id_compare_values_array = np.array(id_compare_values).transpose(1,0)
+                    min_indexs = np.argmin(id_compare_values_array,axis=0)
+                    min_value = np.min(id_compare_values_array,axis=0)
+                    swap_result_list = []
+                    swap_result_matrix_list = []
+                    swap_result_ori_pic_list = []
+                    for tmp_index, min_index in enumerate(min_indexs):
+                        if min_value[tmp_index] < id_thres:
+                            swap_result = swap_model(None, frame_align_crop_tenor_list[tmp_index], target_id_norm_list[min_index], None, True)[0]
+                            swap_result_list.append(swap_result)
+                            swap_result_matrix_list.append(frame_mat_list[tmp_index])
+                            swap_result_ori_pic_list.append(frame_align_crop_tenor_list[tmp_index])
+                        else:
+                            pass
+                    if len(swap_result_list) !=0:
+                        final_img = SimSwap.reverse2wholeimage(swap_result_ori_pic_list,swap_result_list, swap_result_matrix_list, crop_size, frame, logoclass,\
+                            os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,use_mask=use_mask,
+                            norm = spNorm, _kernel_size=_kernel_size, face_part_ids=face_part_ids)
+
+                        ########################################################## Two Pass ####################################################################
+                        if self_obj.settings.two_pass.get():
+                            self_obj.set_status(f"Performing two pass... ({int((frame_index/frame_count)*100)}% completed)")
+                            detect_results = detect_model.get(final_img,crop_size)
+                            if detect_results is not None:
+                                if not os.path.exists(temp_results_dir):
+                                        os.mkdir(temp_results_dir)
+                                frame_align_crop_list = detect_results[0]
+                                frame_mat_list = detect_results[1]
+                                id_compare_values = []
+                                frame_align_crop_tenor_list = []
+                                for frame_align_crop in frame_align_crop_list:
+                                    frame_align_crop_tenor = SimSwap._totensor(cv2.cvtColor(frame_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
+                                    frame_align_crop_tenor_arcnorm = spNorm(frame_align_crop_tenor)
+                                    frame_align_crop_tenor_arcnorm_downsample = F.interpolate(frame_align_crop_tenor_arcnorm, size=(112,112))
+                                    frame_align_crop_crop_id_nonorm = swap_model.netArc(frame_align_crop_tenor_arcnorm_downsample)
+                                    id_compare_values.append([])
+                                    for source_specific_id_nonorm_tmp in source_specific_id_nonorm_list:
+                                        id_compare_values[-1].append(mse(frame_align_crop_crop_id_nonorm,source_specific_id_nonorm_tmp).detach().cpu().numpy())
+                                    frame_align_crop_tenor_list.append(frame_align_crop_tenor)
+                                id_compare_values_array = np.array(id_compare_values).transpose(1,0)
+                                min_indexs = np.argmin(id_compare_values_array,axis=0)
+                                min_value = np.min(id_compare_values_array,axis=0)
+                                swap_result_list = []
+                                swap_result_matrix_list = []
+                                swap_result_ori_pic_list = []
+                                for tmp_index, min_index in enumerate(min_indexs):
+                                    if min_value[tmp_index] < id_thres:
+                                        swap_result = swap_model(None, frame_align_crop_tenor_list[tmp_index], target_id_norm_list[min_index], None, True)[0]
+                                        swap_result_list.append(swap_result)
+                                        swap_result_matrix_list.append(frame_mat_list[tmp_index])
+                                        swap_result_ori_pic_list.append(frame_align_crop_tenor_list[tmp_index])
+                                    else:
+                                        pass
+                                if len(swap_result_list) !=0:
+                                    final_img = SimSwap.reverse2wholeimage(swap_result_ori_pic_list,swap_result_list, swap_result_matrix_list, crop_size, frame, logoclass,\
+                                        os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,use_mask=use_mask,
+                                        norm = spNorm, _kernel_size=_kernel_size, face_part_ids=face_part_ids)
+                        ########################################################## Two Pass ####################################################################
+                        if self_obj.stop_process:
+                            return
+                        self_obj.video_player.update_display(image=final_img)
+                        self_obj.set_status(f"Processing {frame_index} of {frame_count}... ({int((frame_index/frame_count)*100)}% completed)")
+                    else:
+                        if not os.path.exists(temp_results_dir):
+                            os.mkdir(temp_results_dir)
+                        frame = frame.astype(np.uint8)
+                        if not no_simswaplogo:
+                            frame = logoclass.apply_frames(frame)
+                        cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
+                else:
+                    if not os.path.exists(temp_results_dir):
+                        os.mkdir(temp_results_dir)
+                    frame = frame.astype(np.uint8)
+                    if not no_simswaplogo:
+                        frame = logoclass.apply_frames(frame)
+                    cv2.imwrite(os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)), frame)
+                    self_obj.set_status(f"Skipping no face...({int((frame_index/frame_count)*100)}% completed)")
             else:
                 break
         video.release()
@@ -294,21 +501,25 @@ class SimSwap:
         opt.output_path = settings.out_path.get()
         opt.video_path = vidPath
         opt.id_thres = 0.03
-        opt.no_simswaplogo = settings.simswap_logo.get()
+        opt.no_simswaplogo = not settings.simswap_logo.get()
 
         start_epoch, epoch_iter = 1, 0
         opt.crop_size = int(settings.crop_size.get())
         crop_size = opt.crop_size
         det_size = int(settings.det_size.get())
         _kernel_size = tuple(map(int, settings.kernel_size.get().split(' ')))
+        face_part_ids = list(map(int, settings.face_part_ids.get().split(' ')))
+        mode = 'None'
+        if settings.ffhq.get():
+            mode = 'ffhq'
 
         torch.nn.Module.dump_patches = True
         if crop_size == 512:
             opt.which_epoch = 550000
             opt.name = '512'
-            mode = 'None'
-        else:
-            mode = 'None'
+            #mode = 'ffhq'
+        #else:
+        #    mode = 'None'
         model = create_model(opt)
         model.eval()
 
@@ -333,8 +544,17 @@ class SimSwap:
                 latend_id = model.netArc(img_id_downsample)
                 latend_id = F.normalize(latend_id, p=2, dim=1)
 
-                SimSwap.video_swap(opt.video_path, latend_id, model, app, opt.output_path,temp_results_dir=opt.temp_path,\
-                    no_simswaplogo=opt.no_simswaplogo,use_mask=opt.use_mask, self_obj=self_obj, _kernel_size=_kernel_size)
+                SimSwap.video_swap(
+                    opt.video_path,
+                    latend_id, model,
+                    app,
+                    opt.output_path,
+                    temp_results_dir=opt.temp_path,\
+                    no_simswaplogo=opt.no_simswaplogo,
+                    use_mask=opt.use_mask,
+                    self_obj=self_obj,
+                    _kernel_size=_kernel_size,
+                    face_part_ids=face_part_ids)
             else:
                 specific_person_whole = dstImg
                 specific_person_align_crop, _ = app.get(specific_person_whole,crop_size)
@@ -358,7 +578,88 @@ class SimSwap:
                     use_mask=opt.use_mask,
                     crop_size=crop_size,
                     self_obj=self_obj,
-                    _kernel_size=_kernel_size)
+                    _kernel_size=_kernel_size,
+                    face_part_ids=face_part_ids)
+
+    def swap_multi_specific(src_dst_dict, vidPath, settings, self_obj=None):
+        transformer = transforms.Compose([transforms.ToTensor(),])
+        transformer_Arcface = transforms.Compose([transforms.ToTensor(),transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        opt = TestOptions().parse()
+        opt.Arc_path = settings.arc_path.get()
+        opt.temp_path = settings.temp_path.get()
+        opt.use_mask = settings.use_mask.get()
+        opt.output_path = settings.out_path.get()
+        opt.video_path = vidPath
+        opt.id_thres = 0.03
+        opt.no_simswaplogo = not settings.simswap_logo.get()
+
+        start_epoch, epoch_iter = 1, 0
+        opt.crop_size = int(settings.crop_size.get())
+        crop_size = opt.crop_size
+        det_size = int(settings.det_size.get())
+        _kernel_size = tuple(map(int, settings.kernel_size.get().split(' ')))
+        face_part_ids = list(map(int, settings.face_part_ids.get().split(' ')))
+        mode = 'None'
+        if settings.ffhq.get():
+            mode = 'ffhq'
+
+        torch.nn.Module.dump_patches = True
+        if crop_size == 512:
+            opt.which_epoch = 550000
+            opt.name = '512'
+            #mode = 'ffhq'
+        #else:
+        #    mode = 'None'
+        model = create_model(opt)
+        model.eval()
+
+        app = Face_detect_crop(name='antelope', root='./insightface_func/models')
+        app.prepare(ctx_id= 0, det_thresh=settings.det_thresh.get(), det_size=(det_size,det_size), mode=mode)
+
+        with torch.no_grad():
+            source_specific_id_nonorm_list = []
+            target_id_norm_list = []
+
+            for key in src_dst_dict:
+                _src = src_dst_dict[key][1]
+                _dst = src_dst_dict[key][0]
+
+                specific_person_align_crop, _ = app.get(_src, crop_size)
+                specific_person_align_crop_pil = Image.fromarray(cv2.cvtColor(specific_person_align_crop[0],cv2.COLOR_BGR2RGB))
+                specific_person = transformer_Arcface(specific_person_align_crop_pil)
+                specific_person = specific_person.view(-1, specific_person.shape[0], specific_person.shape[1], specific_person.shape[2])
+                specific_person = specific_person.cuda()
+                specific_person_downsample = F.interpolate(specific_person, size=(112,112))
+                specific_person_id_nonorm = model.netArc(specific_person_downsample)
+                source_specific_id_nonorm_list.append(specific_person_id_nonorm.clone())
+
+                img_a_align_crop, _ = app.get(_dst,crop_size)
+                img_a_align_crop_pil = Image.fromarray(cv2.cvtColor(img_a_align_crop[0],cv2.COLOR_BGR2RGB))
+                img_a = transformer_Arcface(img_a_align_crop_pil)
+                img_id = img_a.view(-1, img_a.shape[0], img_a.shape[1], img_a.shape[2])
+                img_id = img_id.cuda()
+                img_id_downsample = F.interpolate(img_id, size=(112,112))
+                latend_id = model.netArc(img_id_downsample)
+                latend_id = F.normalize(latend_id, p=2, dim=1)
+                target_id_norm_list.append(latend_id.clone())
+
+            assert len(target_id_norm_list) == len(source_specific_id_nonorm_list)
+
+            SimSwap.video_swap_multispecific(
+                opt.video_path,
+                target_id_norm_list,
+                source_specific_id_nonorm_list,
+                opt.id_thres,
+                model,
+                app,
+                opt.output_path,
+                temp_results_dir=opt.temp_path,
+                no_simswaplogo=opt.no_simswaplogo,
+                use_mask=opt.use_mask,
+                crop_size=crop_size,
+                self_obj=self_obj,
+                _kernel_size=_kernel_size,
+                face_part_ids=face_part_ids)
 
 class Utils:
     def remove_files(folder):
@@ -650,6 +951,9 @@ class MenuBar:
         self.filemenu = tk.Menu(self.menu_bar, tearoff=0)
         self.menu_bar.add_cascade(label="File", menu=self.filemenu)
 
+        self.editmenu = tk.Menu(self.menu_bar, tearoff=0)
+        self.menu_bar.add_cascade(label="Edit", menu=self.editmenu)
+
         helpmenu = tk.Menu(self.menu_bar, tearoff=0)
         url = "https://github.com/harisreedhar/SimSwap-GUI"
         helpmenu.add_command(label="Report", command=lambda: webbrowser.open(url, new=1))
@@ -660,11 +964,17 @@ class MenuBar:
 
     def set_menubar_functions(self, functions):
         self.filemenu.add_command(label="Import video", command=functions.get("open video"))
+        self.filemenu.add_command(label="Import source image", command=functions.get("import source"))
+        self.filemenu.add_command(label="Import target image", command=functions.get("import target"))
         self.filemenu.add_separator()
+        #self.filemenu.add_command(label="Open output directory", command=functions.get("open out dir"))
         self.filemenu.add_command(label="Clear temp path", command=functions.get("clear temp"))
         self.filemenu.add_command(label="Clear trim path", command=functions.get("clear trim"))
         self.filemenu.add_separator()
         self.filemenu.add_command(label="Quit", command=functions.get("quit"))
+
+        self.editmenu.add_command(label="Reset trim", command=functions.get("reset trim"))
+        self.editmenu.add_command(label="Trim & reload", command=functions.get("trim & reload"))
 
 class StatusBar:
     def __init__(self, root):
@@ -718,13 +1028,25 @@ class SettingsWindow:
         crop_size_label = ttk.Label(settings_frame, text="Crop Size")
         self.crop_size_entry = ttk.Entry(settings_frame, width= _width_2, textvariable=self.crop_size)
 
+        self.ffhq = tk.BooleanVar()
+        self.ffhq.set(FFHQ)
+        self.use_ffhq_check = ttk.Checkbutton(settings_frame, text="ffhq", variable=self.ffhq)
+
+        self.face_part_ids = tk.StringVar()
+        self.face_part_ids.set(FACE_PART_IDS)
+        self.face_part_ids_entry = ttk.Entry(settings_frame, width= _width, textvariable=self.face_part_ids)
+
         self.use_mask = tk.BooleanVar()
-        self.use_mask.set(True)
-        self.use_mask_check = ttk.Checkbutton(settings_frame, text="Use Mask", variable=self.use_mask)
+        self.use_mask.set(USE_MASK)
+        self.use_mask_check = ttk.Checkbutton(settings_frame, text="Use Mask", variable=self.use_mask, command=lambda e=self.face_part_ids_entry, v=self.use_mask: self.set_state(e,v))
 
         self.simswap_logo = tk.BooleanVar()
-        self.simswap_logo.set(True)
-        self.simswap_logo_check = ttk.Checkbutton(settings_frame, text="Disable Watermark", variable=self.simswap_logo)
+        self.simswap_logo.set(WATERMARK)
+        self.simswap_logo_check = ttk.Checkbutton(settings_frame, text="Watermark", variable=self.simswap_logo)
+
+        self.two_pass = tk.BooleanVar()
+        self.two_pass.set(0)
+        self.two_pass_check = ttk.Checkbutton(settings_frame, text="Two Pass", variable=self.two_pass)
 
         out_path_label.grid(sticky="W",column=0, row=1)
         self.out_path_entry.grid(sticky="W",column=1, row=1, padx=(5,0))
@@ -747,8 +1069,19 @@ class SettingsWindow:
         crop_size_label.grid(sticky="W",column=2, row=4, padx=(5,0))
         self.crop_size_entry.grid(sticky="W",column=3, row=4, padx=(2,0))
 
-        self.use_mask_check.grid(sticky="W",column=2, row=5, padx=(5,0))
-        self.simswap_logo_check.grid(sticky="W",column=3, row=5)
+        self.use_mask_check.grid(sticky="W",column=0, row=5)
+        self.face_part_ids_entry.grid(sticky="W",column=1, row=5, padx=(5,0))
+
+        #uncomment this to try two pass
+        #self.two_pass_check.grid(sticky="W",column=4, row=1, padx=(5,0))
+        self.use_ffhq_check.grid(sticky="W",column=4, row=1, padx=(5,0))
+        self.simswap_logo_check.grid(sticky="W",column=4, row=2, padx=(5,0))
+
+    def set_state(self, entry, var):
+        if var.get() == 0:
+            entry.configure(state='disabled')
+        else:
+            entry.configure(state='normal')
 
 class MainWindow:
     def __init__(self, root, monitor_size=(300,400)):
@@ -764,19 +1097,26 @@ class MainWindow:
         self.frame_3 = ttk.Frame(self.main_frame)
         self.frame_3.grid(column=1, row=0, sticky="nw", pady=5)
         self.frame_4 = ttk.Frame(self.main_frame)
-        self.frame_4.grid(column=1, row=1, sticky="nw", pady=5)
+        self.frame_4.grid(column=1, row=1, sticky="nw", pady=5, padx=5)
 
         self.src_img = None
         self.dst_img = None
         self.video_file_path = None
         self.stop_process = False
+        self.multi_specific_data = {}
+        self.list_box_counter = 0
 
         self.menuBar = MenuBar(self.root)
         menu_functions = {
             "open video": self.open_video,
+            "open out dir": lambda: subprocess.Popen(["xdg-open", self.settings.temp_path.get()]),
             "clear temp": lambda: Utils.remove_files(self.settings.temp_path.get()),
             "clear trim": lambda: Utils.remove_files(self.settings.trim_path.get()),
             "quit": lambda: self.cancel_process(exit=True),
+            "reset trim": lambda: self.video_file_path if self.open_video(file_path=self.video_file_path) else False,
+            "trim & reload": self.trim_and_reload,
+            "import source": self.select_source_face,
+            "import target": self.select_target_face
             }
         self.menuBar.set_menubar_functions(menu_functions)
         self.staus_bar = StatusBar(self.root)
@@ -793,30 +1133,52 @@ class MainWindow:
         self.frame_2_2 = ttk.Frame(self.frame_3)
         self.frame_2_2.grid(column=0, row=0)
         src_img = Utils.pil_create_txt_image(ICON_SIZE, "Source")
-        self.src_btn = ttk.Button(self.frame_2_2, image=src_img, command=self.select_source_face)
+        self.src_btn = ttk.Button(self.frame_2_2, image=src_img, command=lambda: self.select_source_face(from_roi=True))
 
         ## drag and drop
         self.src_btn.drop_target_register(DND_FILES)
         self.src_btn.dnd_bind('<<Drop>>', lambda e: self.select_source_face(file_path=e.data))
-        self.src_btn.grid(column=0, row=0)
+        self.src_btn.grid(column=1, row=0)
         self.src_btn.photo = src_img
-        ttk.Label(self.frame_2_2, text="Source").grid(column=0, row=1)
+
+        canvas_1_manage = tk.Canvas(self.frame_2_2, width = 12, height = 60)
+        canvas_1_manage.grid(row = 0, column = 0)
+        canvas_1_manage.create_text(6, 60, text = " Source ", angle = 90, anchor = "w")
 
         dst_img = Utils.pil_create_txt_image(ICON_SIZE, "Target")
-        self.dst_btn = ttk.Button(self.frame_2_2, image=dst_img, command=self.select_target_face)
-        self.dst_btn.grid(column=0, row=2)
+        self.dst_btn = ttk.Button(self.frame_2_2, image=dst_img, command=lambda: self.select_target_face(from_roi=True))
+        self.dst_btn.drop_target_register(DND_FILES)
+        self.dst_btn.dnd_bind('<<Drop>>', lambda e: self.select_target_face(file_path=e.data))
+        self.dst_btn.grid(column=1, row=1)
         self.dst_btn.photo = dst_img
-        ttk.Label(self.frame_2_2, text="Target").grid(column=0, row=3)
 
-        self.trim_rst_btn = ttk.Button(self.frame_2_2, text="Reset Trim", width=15, command=lambda: self.video_file_path if self.open_video(file_path=self.video_file_path) else False)
-        self.trim_rel_btn = ttk.Button(self.frame_2_2, text="Trim & Reload", width=15, command=self.trim_and_reload)
-        self.trim_rst_btn.grid(column=0, row=4, pady=(10,0))
-        self.trim_rel_btn.grid(column=0, row=5, pady=(2,0))
+        canvas_2_manage = tk.Canvas(self.frame_2_2, width = 12, height = 60)
+        canvas_2_manage.grid(row = 1, column = 0)
+        canvas_2_manage.create_text(6, 60, text = " Target ", angle = 90, anchor = "w")
+        ttk.Label(self.frame_3, text="Source-Target List").grid(column=0, row=1, pady=(10,0), sticky="w")
 
-        self.swap_target_btn = ttk.Button(self.frame_4, text="Swap Target", width=15, command=lambda: threading.Thread(target=self.run_target_swap).start())
-        self.swap_all_btn = ttk.Button(self.frame_4, text="Swap All", width=15, command=lambda: threading.Thread(target=self.run_all_swap).start())
-        self.swap_target_btn.grid(column=0, row=1, padx=(0,5))
-        self.swap_all_btn.grid(column=0, row=2, pady=(2,0), padx=(0,5))
+        self.list_box = tk.Listbox(self.frame_3, selectmode=tk.EXTENDED, width = 20)
+        self.list_box.bind('<<ListboxSelect>>', lambda e: self.list_box_select_preview())
+        self.list_box.grid(column=0, row=2, sticky="nsew", padx=(0,10))
+        self.list_box_btn_frame = ttk.Frame(self.frame_3)
+        self.list_box_btn_frame.grid(column=0 ,row=3, sticky="nsew")
+
+        self.lst_add_btn = ttk.Button(self.list_box_btn_frame, text="+", width=2, command=self.list_box_add_func)
+        self.lst_add_btn.grid(row=0, column=1)
+        self.lst_remove_btn = ttk.Button(self.list_box_btn_frame, text="-", width=2, command=self.list_box_remove_func)
+        self.lst_remove_btn.grid(row=0, column=2)
+        self.lst_update_btn = ttk.Button(self.list_box_btn_frame, text="Updt", width=4, command=self.list_box_update_func)
+        self.lst_update_btn.grid(row=0, column=3)
+        self.lst_clear_btn = ttk.Button(self.list_box_btn_frame, text="Clr", width=3, command=self.list_box_clear_func)
+        self.lst_clear_btn.grid(row=0, column=4)
+
+        _btn_width = 17
+        self.swap_all_btn = ttk.Button(self.frame_4, text="Swap All", width=_btn_width, command=lambda: threading.Thread(target=self.run_all_swap).start())
+        self.swap_target_btn = ttk.Button(self.frame_4, text="Swap Single", width=_btn_width, command=lambda: threading.Thread(target=self.run_target_swap).start())
+        self.swap_multi_btn = ttk.Button(self.frame_4, text="Swap Multiple", width=_btn_width, command=lambda: threading.Thread(target=self.run_multi_swap).start())
+        self.swap_all_btn.grid(column=0, row=1)
+        self.swap_target_btn.grid(column=0, row=2, pady=(2,0))
+        self.swap_multi_btn.grid(column=0, row=3, pady=(2,0))
 
     def prepare_run(func):
         def wrapper(self, *arg, **kwargs):
@@ -835,11 +1197,61 @@ class MainWindow:
             return res
         return wrapper
 
+    def list_box_select_preview(self, *args):
+        if self.list_box.size() > 0:
+            try:
+                [index] = self.list_box.curselection()
+            except ValueError:
+                return
+            key = self.list_box.get(index)
+            data = self.multi_specific_data[key]
+            self.src_img = data[0]
+            self.dst_img = data[1]
+            self.src_dst_btn_img()
+
+    def list_box_add_func(self):
+        if self.src_img is None: return
+        if self.dst_img is None: return
+        val = str(self.list_box_counter).zfill(4)
+        key = f"SRC-DST-{val}"
+        self.list_box.insert(tk.END, key)
+        self.multi_specific_data[key] = [self.src_img, self.dst_img]
+        self.list_box_counter += 1
+
+    def list_box_remove_func(self):
+        try:
+            [index] = self.list_box.curselection()
+        except ValueError:
+            return
+        key = self.list_box.get(index)
+        del self.multi_specific_data[key]
+        self.list_box.delete(index)
+        self.list_box.select_set(max(index, self.list_box.size()-1))
+
+    def list_box_update_func(self):
+        if self.src_img is None: return
+        if self.dst_img is None: return
+        try:
+            [index]=self.list_box.curselection()
+        except ValueError:
+            return
+        key = self.list_box.get(index)
+        self.multi_specific_data[key] = [self.src_img, self.dst_img]
+
+    def list_box_clear_func(self):
+        self.multi_specific_data.clear()
+        self.list_box_counter = 0
+        self.list_box.delete(0, tk.END)
+
     def set_status(self, text):
         _text = (text[:100] + '..') if len(text) > 100 else text
         self.staus_bar.status.config(text=_text)
 
-    def select_source_face(self, file_path=None):
+    def select_source_face(self, file_path=None, from_roi=False):
+        if from_roi:
+            self.src_img = self.get_roi_img()
+            self.src_dst_btn_img()
+            return
         if file_path is None:
             file_path = tk.filedialog.askopenfilename(initialdir=CWD, title="Select source image")
         if file_path:
@@ -848,16 +1260,27 @@ class MainWindow:
             self.src_dst_btn_img()
             self.set_status(f"source face: {file_path}")
 
-    def select_target_face(self):
-        if not self.video_player.reader_available:
-            self.set_status("Open a video first")
+    def select_target_face(self, file_path=None, from_roi=False):
+        if from_roi:
+            self.dst_img = self.get_roi_img()
+            self.src_dst_btn_img()
             return
+        if file_path is None:
+            file_path = tk.filedialog.askopenfilename(initialdir=CWD, title="Select target image")
+        if file_path:
+            src = cv2.imread(file_path)
+            self.dst_img = src
+            self.src_dst_btn_img()
+            self.set_status(f"source face: {file_path}")
+
+    def get_roi_img(self):
+        if not self.video_player.reader_available:
+            self.set_status("?")
+            return None
         x1, y1, x2, y2 = self.video_player.monitor_img.get_roi()
         cv_image = cv2.cvtColor(np.array(self.video_player.monitor_img.image), cv2.COLOR_RGB2BGR)
         cropped_image = cv_image[y1:y2, x1:x2]
-        self.dst_img = cropped_image
-        self.src_dst_btn_img()
-        self.set_status("Done.")
+        return cropped_image
 
     def open_video(self, file_path=None):
         try:
@@ -885,12 +1308,27 @@ class MainWindow:
         if self.dst_img is None:
             self.set_status("Target face not selected")
             return
-        self.set_status("Starting target face swap...")
+        if self.src_img is None:
+            self.set_status("Source face not selected")
+            return
+        self.set_status("Starting single target face swap...")
         SimSwap.runSwap(self.src_img, self.dst_img, self.video_file_path, self.settings, self_obj=self)
         self.set_status("Done.")
 
     @prepare_run
+    def run_multi_swap(self):
+        if len(self.multi_specific_data) == 0:
+            self.set_status("List is empty")
+            return
+        self.set_status("Starting multi target face swap...")
+        SimSwap.swap_multi_specific(self.multi_specific_data, self.video_file_path, self.settings, self_obj=self)
+        self.set_status("Done.")
+
+    @prepare_run
     def run_all_swap(self):
+        if self.src_img is None:
+            self.set_status("Source face not selected")
+            return
         self.set_status("Starting all face swap...")
         SimSwap.runSwap(self.src_img, self.dst_img, self.video_file_path, self.settings, swap_all=True, self_obj=self)
         self.set_status("Done.")
